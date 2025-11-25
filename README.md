@@ -69,8 +69,8 @@ CREATE TABLE product (
     category_id INT NOT NULL,
     name VARCHAR(50) NOT NULL,
     description VARCHAR(200) NOT NULL,
-    price DECIMAL(10,2) NOT NULL,
-    stock_quantity INT NOT NULL,
+    price DECIMAL(10,2) NOT NULL CHECK (price > 0),
+    stock_quantity INT NOT NULL CHECK (stock_quantity >= 0),
     CONSTRAINT FK_product_category
         FOREIGN KEY (category_id)
         REFERENCES category(category_id)
@@ -84,8 +84,8 @@ CREATE TABLE order_details (
     order_detail_id INT AUTO_INCREMENT PRIMARY KEY,
     order_id INT NOT NULL,
     product_id INT NOT NULL,
-    quantity INT NOT NULL,
-    unit_price DECIMAL(10,2) NOT NULL,
+    quantity INT NOT NULL CHECK (quantity > 0),
+    unit_price DECIMAL(10,2) NOT NULL CHECK (unit_price >= 0),
     CONSTRAINT FK_order_details_order
         FOREIGN KEY (order_id)
         REFERENCES orders(order_id)
