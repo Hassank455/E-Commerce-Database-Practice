@@ -164,9 +164,18 @@ FROM orders
 WHERE order_date = '2025-01-05';
 ```
 
-### 5.2. Monthly Top-Selling Products
+### **5.2. Monthly Top-Selling Products**
 
-**Goal:** Retrieve the top-selling products (based on quantity sold) for a specific month.
+There are **two types** of “top-selling” metrics used in e-commerce analytics:
+
+### 🟡 **A. Top-Selling Products by Quantity (Units Sold)**
+
+**Meaning:**  
+Products ranked by the **number of items sold**, regardless of price.
+
+**Example:**  
+A **$10 T-shirt** sold **300 times**  
+is ranked higher than a **$100 item** sold **20 times**.
 
 ```sql
 SELECT 
@@ -181,6 +190,32 @@ WHERE o.order_date >= '2025-01-01'
   AND o.order_date <  '2025-02-01'
 GROUP BY p.product_id, p.name
 ORDER BY total_quantity DESC
+LIMIT 5;
+```
+
+### 🟡 **B. Top-Selling Products by Revenue (Money Earned)**
+
+**Meaning:**  
+Products ranked by **total revenue generated** (money earned).<br>
+This is often the **true business definition** of “top-selling”.
+
+**Example:**  
+An **iPhone ($1000)** sold **5 units**<br>
+earns more than a **$10 T-shirt** sold **100 units**.
+
+```sql
+SELECT 
+    p.name AS top_selling_product, 
+    SUM(od.quantity * od.unit_price) AS total_revenue
+FROM order_details od 
+JOIN product p 
+    ON p.product_id = od.product_id
+JOIN orders o
+    ON o.order_id = od.order_id
+WHERE o.order_date >= '2025-01-01' 
+  AND o.order_date <  '2025-02-01'
+GROUP BY p.product_id, p.name
+ORDER BY total_revenue DESC
 LIMIT 5;
 ```
 
