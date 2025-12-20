@@ -306,3 +306,112 @@ In some cases, reporting queries that require customer information may become ex
 - Slightly increased storage usage.
 
 This trade-off is common in analytical systems where read performance is more important than write efficiency.
+
+---
+
+## 7. Sale History Trigger (Automatic Sales Logging)
+
+To support analytics and reporting use cases, a **sale history mechanism** was implemented using a database trigger.  
+This trigger automatically records sales data whenever a new order line is inserted.
+
+### 7.1. Purpose
+
+The goal of this trigger is to:
+
+- Capture **sales transactions automatically**
+- Store a **denormalized snapshot** of sales data
+- Improve performance for reporting and analytics queries
+- Avoid expensive joins between `orders`, `order_details`, and `customer`
+
+Each row inserted into `order_details` represents a real sale line, making it the ideal trigger point.
+
+---
+
+### 7.2. Sale History Table
+
+The `sale_history` table stores a snapshot of each sold product at the time of purchase.
+
+```sql
+CREATE TABLE sale_history (
+    sale_id INT AUTO_INCREMENT PRIMARY KEY,
+    order_id INT NOT NULL,
+    order_date DATE NOT NULL,
+    customer_id INT NOT NULL,
+    product_id INT NOT NULL,
+    quantity INT NOT NULL,
+    unit_price DECIMAL(10,2) NOT NULL,
+    line_total DECIMAL(10,2) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+---
+
+### 7.3. Trigger: Create Sale History on Order Line Insert
+
+The following trigger is executed **after inserting a new row into order_details.** <br>
+It combines data from the newly inserted order line and its related order header.
+
+```sql
+-- Change delimiter to allow multiple SQL statements in trigger
+DELIMITER $$
+-- Trigger: Automatically create a sale history record
+-- Fired after inserting a new order line (order_details)
+CREATE TRIGGER trg_create_sale_history
+AFTER INSERT ON order_details
+-- FOR EACH ROW = trigger executes once per inserted row
+FOR EACH ROW
+BEGIN
+    INSERT INTO sale_history (
+        order_id,
+        order_date,
+        customer_id,
+        product_id,
+        quantity,
+        unit_price,
+        line_total
+    )
+    -- NEW = refers to the inserted order_details row
+    -- Using SELECT allows mixing data from orders + order_details
+    SELECT
+        o.order_id,
+        o.order_date,
+        o.customer_id,
+        NEW.product_id,
+        NEW.quantity,
+        NEW.unit_price,
+        NEW.quantity * NEW.unit_price
+    FROM orders o
+    WHERE o.order_id = NEW.order_id;
+END;
+
+-- Restore default delimiter
+DELIMITER ;
+```
+
+---
+
+### 7.4. Trigger Execution Example
+
+```sql
+INSERT INTO order_details (order_id, product_id, quantity, unit_price)
+VALUES (1, 5, 2, 150);
+```
+
+This automatically generates the following record in sale_history:
+
+| sale_id | order_id | order_date  | customer_id | product_id | quantity | unit_price | line_total | created_at           |
+|--------:|---------:|------------|------------:|-----------:|---------:|-----------:|-----------:|----------------------|
+| 1       | 1        | 2025-01-05 | 1           | 5          | 2        | 150        | 300        | 2025-12-20 10:18:29  |
+
+---
+
+### 7.5. Design Notes
+
+- The trigger runs **AFTER INSERT** to ensure all NEW.* values exist.
+- `order_details` is used instead of orders because it contains actual sales data.
+- `sale_history` is intentionally denormalized for fast reporting.
+- One `order_details` row = one real sales transaction.
+- This approach is commonly used in analytical and reporting systems.
+
+---
