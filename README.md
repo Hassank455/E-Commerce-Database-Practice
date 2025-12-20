@@ -400,18 +400,188 @@ VALUES (1, 5, 2, 150);
 
 This automatically generates the following record in sale_history:
 
-| sale_id | order_id | order_date  | customer_id | product_id | quantity | unit_price | line_total | created_at           |
-|--------:|---------:|------------|------------:|-----------:|---------:|-----------:|-----------:|----------------------|
-| 1       | 1        | 2025-01-05 | 1           | 5          | 2        | 150        | 300        | 2025-12-20 10:18:29  |
+| sale_id | order_id | order_date | customer_id | product_id | quantity | unit_price | line_total | created_at          |
+| ------: | -------: | ---------- | ----------: | ---------: | -------: | ---------: | ---------: | ------------------- |
+|       1 |        1 | 2025-01-05 |           1 |          5 |        2 |        150 |        300 | 2025-12-20 10:18:29 |
 
 ---
 
 ### 7.5. Design Notes
 
-- The trigger runs **AFTER INSERT** to ensure all NEW.* values exist.
+- The trigger runs **AFTER INSERT** to ensure all NEW.\* values exist.
 - `order_details` is used instead of orders because it contains actual sales data.
 - `sale_history` is intentionally denormalized for fast reporting.
 - One `order_details` row = one real sales transaction.
 - This approach is commonly used in analytical and reporting systems.
 
 ---
+
+### Lock Quantity Field for a Product
+
+Although the requirement is to lock a single field (`stock_quantity`),  
+MySQL applies locks at the **row level**, not the column level.
+
+The following example demonstrates how this is achieved using transactions.
+
+##
+
+#### Transaction A (Lock Holder)
+
+```sql
+START TRANSACTION;
+
+-- Locks the row that contains product_id = 211
+-- Prevents other transactions from updating stock_quantity
+SELECT stock_quantity
+FROM product
+WHERE product_id = 211
+FOR UPDATE;
+```
+
+The transaction remains open and holds the lock on the row.
+
+##
+
+#### Transaction B (Blocked Transaction)
+
+```sql
+UPDATE product
+SET stock_quantity = stock_quantity + 1
+WHERE product_id = 211;
+```
+
+This update will be blocked until Transaction A commits or rolls back.
+
+##
+
+#### Release the Lock
+
+```sql
+COMMIT;
+```
+
+Once the transaction is committed, the lock is released and
+Transaction B continues execution.
+
+**Note:**
+Even though the intention is to lock a single column,
+InnoDB enforces locking at the row level, not the column level.
+
+---
+
+### Lock an Entire Product Row
+
+In this task, the goal is to explicitly lock the entire row of a product
+to prevent any updates or deletions by other transactions.
+
+##
+
+#### Transaction A (Row Lock Holder)
+
+```sql
+START TRANSACTION;
+
+-- Locks the entire row for product_id = 211
+SELECT *
+FROM product
+WHERE product_id = 211
+FOR UPDATE;
+```
+
+The transaction holds an exclusive lock on the selected row.
+
+##
+
+#### Transaction B (Blocked Transaction)
+
+```sql
+UPDATE product
+SET stock_quantity = 0
+WHERE product_id = 211;
+```
+
+This statement will be blocked until the lock is released.
+
+##
+
+#### Release the Lock
+
+```sql
+COMMIT;
+```
+
+After committing, the row lock is released and other transactions may proceed.
+
+---
+
+### Full-Text Search on Products
+
+This section demonstrates how **Full-Text Search** can be used to search text-based
+columns more efficiently than traditional `LIKE` queries.
+
+A FULLTEXT index is required on the searchable columns before running these queries.
+
+##
+
+#### Create Full-Text Index
+
+```sql
+CREATE FULLTEXT INDEX idx_product_text_search
+ON product (name, description);
+```
+
+##
+
+#### Query 1: Basic Full-Text Search
+
+This query retrieves all products that contain the keyword `"camera"`
+in either the product name or description using Full-Text Search.
+
+```sql
+SELECT *
+FROM product
+WHERE MATCH(name, description)
+AGAINST ('camera');
+```
+
+**Explanation:**
+- Uses the FULLTEXT index to search text efficiently
+- Returns matching rows only (true / false match)
+- Does not rank results by relevance
+- Result order is not guaranteed
+
+##
+
+#### Query 2: Full-Text Search with Relevance Ranking
+
+This query improves the basic full-text search by calculating a **relevance score**
+and ordering the results from most relevant to least relevant.
+
+```sql
+SELECT
+    product_id,
+    name,
+    description,
+
+    -- Calculates how relevant each row is to the search keyword
+    -- Higher score means a better match
+    MATCH(name, description) AGAINST ('camera') AS relevance_score
+
+FROM product
+
+-- Filters rows that match the full-text search condition
+WHERE MATCH(name, description)
+AGAINST ('camera')
+
+-- Orders results so the most relevant products appear first
+ORDER BY relevance_score DESC;
+```
+
+**Explanation:**
+- `MATCH(...) AGAINST(...)` computes a relevance score for each row
+- The score is based on:
+  - Term frequency
+  - Term location (name vs description)
+  - Overall text distribution
+- Results are sorted by relevance, similar to a search engine
+- Suitable for search bars and product discovery features
