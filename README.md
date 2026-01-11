@@ -545,6 +545,7 @@ AGAINST ('camera');
 ```
 
 **Explanation:**
+
 - Uses the FULLTEXT index to search text efficiently
 - Returns matching rows only (true / false match)
 - Does not rank results by relevance
@@ -578,6 +579,7 @@ ORDER BY relevance_score DESC;
 ```
 
 **Explanation:**
+
 - `MATCH(...) AGAINST(...)` computes a relevance score for each row
 - The score is based on:
   - Term frequency
@@ -585,3 +587,608 @@ ORDER BY relevance_score DESC;
   - Overall text distribution
 - Results are sorted by relevance, similar to a search engine
 - Suitable for search bars and product discovery features
+
+---
+
+## 8. Test Data Generation (Bulk Inserts)
+
+To practice performance tuning and query optimization on realistic workloads,
+the database needs large-scale test data (hundreds of thousands to millions of rows).
+
+This section provides **stored procedures** to generate bulk data for:
+
+- categories
+- products
+- customers
+- orders + order_details (based on existing customers/products)
+
+> Note:
+> In MySQL, **stored procedures** are the recommended way for bulk inserts.
+> Using `FUNCTION` for inserts is generally discouraged because functions should avoid data side effects.
+
+---
+
+### 8.1. Generate Categories (~100 rows)
+
+This procedure inserts a number of categories with unique names.
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE insert_bulk_categories(IN total_rows INT)
+BEGIN
+    DECLARE i INT DEFAULT 1;
+
+    START TRANSACTION;
+
+    WHILE i <= total_rows DO
+        INSERT INTO category (category_name)
+        VALUES (CONCAT('Category ', i));
+
+        SET i = i + 1;
+    END WHILE;
+
+    COMMIT;
+END$$
+
+DELIMITER ;
+```
+
+Run:
+
+```sql
+CALL insert_bulk_categories(100);
+```
+
+Verify:
+
+```sql
+SELECT COUNT(*) FROM category;
+```
+
+---
+
+### 8.2. Generate Products (~100K rows)
+
+This procedure inserts a large number of products.
+Each product is assigned to a random category.
+
+> Requirement: Make sure categories exist first.
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE insert_bulk_products(IN total_rows INT)
+BEGIN
+    DECLARE i INT DEFAULT 1;
+    DECLARE random_category INT;
+    DECLARE random_price DECIMAL(10,2);
+    DECLARE random_stock INT;
+    DECLARE max_category_id INT;
+
+    -- Get max category_id to generate valid FK values
+    SELECT MAX(category_id) INTO max_category_id FROM category;
+
+    START TRANSACTION;
+
+    WHILE i <= total_rows DO
+        SET random_category = FLOOR(1 + RAND() * max_category_id);
+        SET random_price    = ROUND(10 + RAND() * 990, 2);
+        SET random_stock    = FLOOR(RAND() * 500);
+
+        INSERT INTO product (
+            category_id,
+            name,
+            description,
+            price,
+            stock_quantity
+        )
+        VALUES (
+            random_category,
+            CONCAT('Product ', i),
+            CONCAT('Description for product ', i),
+            random_price,
+            random_stock
+        );
+
+        SET i = i + 1;
+    END WHILE;
+
+    COMMIT;
+END$$
+
+DELIMITER ;
+```
+
+Run:
+
+```sql
+CALL insert_bulk_products(100000);
+```
+
+Verify:
+
+```sql
+SELECT COUNT(*) FROM product;
+```
+
+---
+
+### 8.3. Generate Customers (~1,000,000 Rows)
+
+This procedure inserts approximately one million customers.
+
+Special care is taken to ensure that the `email` column remains **unique**,
+as required by the table constraint.
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE insert_bulk_customers(IN total_rows INT)
+BEGIN
+    DECLARE i INT DEFAULT 1;
+
+    START TRANSACTION;
+
+    WHILE i <= total_rows DO
+        INSERT INTO customer (
+            first_name,
+            last_name,
+            email,
+            password
+        )
+        VALUES (
+            CONCAT('First', i),
+            CONCAT('Last', i),
+            CONCAT('user', i, '@example.com'),
+            CONCAT('hashed_password_', i)
+        );
+
+        SET i = i + 1;
+    END WHILE;
+
+    COMMIT;
+END$$
+
+DELIMITER ;
+```
+
+Run:
+
+```sql
+CALL insert_bulk_customers(1000000);
+```
+
+Verify:
+
+```sql
+SELECT COUNT(*) FROM customer;
+```
+
+---
+
+### 8.4. Generate Orders and Order Details (~5 Million Rows)
+
+To simulate a realistic high-traffic e-commerce system and enable advanced
+performance testing, this step generates **large-scale transactional data**
+for both `orders` and `order_details` tables.
+
+The generated data is fully based on:
+
+- Existing customers in the `customer` table
+- Existing products and prices in the `product` table
+
+Target volume (adopted strategy):
+
+- **800,000 orders**
+- **5 to 8 order lines** per order
+- Total `order_details` ≈ 5,000,000 rows
+
+> **Important:**<br>
+> If the sale_history trigger is enabled, inserting ~5M order lines will also
+> insert ~5M rows into sale_history. This is expected, but it will increase runtime.
+
+##
+
+#### 8.4.1. Stored Procedure: Bulk Orders + Order Details
+
+This stored procedure:
+
+- Inserts rows into `orders`
+- Inserts multiple rows into `order_details` per order
+- Calculates and updates `orders.total_amount`
+- Generates random order dates within a defined range
+
+```sql
+DELIMITER $$
+
+CREATE PROCEDURE insert_bulk_orders_and_details(
+    IN total_orders INT,
+    IN min_lines_per_order INT,
+    IN max_lines_per_order INT,
+    IN start_date DATE,
+    IN end_date DATE
+)
+BEGIN
+    DECLARE o INT DEFAULT 1;
+    DECLARE l INT;
+    DECLARE lines_count INT;
+
+    DECLARE random_customer_id INT;
+    DECLARE random_product_id INT;
+    DECLARE random_qty INT;
+    DECLARE unit_price_val DECIMAL(10,2);
+
+    DECLARE order_total DECIMAL(10,2);
+    DECLARE new_order_id INT;
+
+    DECLARE min_customer_id INT;
+    DECLARE max_customer_id INT;
+    DECLARE min_product_id INT;
+    DECLARE max_product_id INT;
+
+    DECLARE day_range INT;
+
+    -- Fetch ID ranges to generate valid foreign keys
+    SELECT MIN(customer_id), MAX(customer_id)
+    INTO min_customer_id, max_customer_id
+    FROM customer;
+
+    SELECT MIN(product_id), MAX(product_id)
+    INTO min_product_id, max_product_id
+    FROM product;
+
+    SET day_range = DATEDIFF(end_date, start_date);
+
+    START TRANSACTION;
+
+    WHILE o <= total_orders DO
+        -- Pick random customer
+        SET random_customer_id =
+            FLOOR(min_customer_id + RAND() * (max_customer_id - min_customer_id + 1));
+
+        -- Insert order header
+        INSERT INTO orders (customer_id, order_date, total_amount)
+        VALUES (
+            random_customer_id,
+            DATE_ADD(start_date, INTERVAL FLOOR(RAND() * (day_range + 1)) DAY),
+            0
+        );
+
+        SET new_order_id = LAST_INSERT_ID();
+        SET order_total = 0;
+
+        -- Determine number of order lines
+        SET lines_count =
+            FLOOR(min_lines_per_order + RAND() *
+                 (max_lines_per_order - min_lines_per_order + 1));
+
+        SET l = 1;
+
+        WHILE l <= lines_count DO
+            -- Pick random product
+            SET random_product_id =
+                FLOOR(min_product_id + RAND() * (max_product_id - min_product_id + 1));
+
+            -- Quantity between 1 and 5
+            SET random_qty = FLOOR(1 + RAND() * 5);
+
+            -- Fetch product price
+            SELECT price
+            INTO unit_price_val
+            FROM product
+            WHERE product_id = random_product_id;
+
+            INSERT INTO order_details (order_id, product_id, quantity, unit_price)
+            VALUES (new_order_id, random_product_id, random_qty, unit_price_val);
+
+            SET order_total = order_total + (random_qty * unit_price_val);
+            SET l = l + 1;
+        END WHILE;
+
+        -- Update total order amount
+        UPDATE orders
+        SET total_amount = order_total
+        WHERE order_id = new_order_id;
+
+        SET o = o + 1;
+
+        -- Optional batching for very large datasets
+        -- IF (o % 10000 = 0) THEN
+        --     COMMIT;
+        --     START TRANSACTION;
+        -- END IF;
+
+    END WHILE;
+
+    COMMIT;
+END$$
+
+DELIMITER ;
+```
+
+##
+
+#### 8.4.2. Run (Adopted Strategy – ~5M Order Lines)
+
+```sql
+CALL insert_bulk_orders_and_details(
+    800000,      -- total orders
+    5,           -- min order lines
+    8,           -- max order lines
+    '2024-01-01',
+    '2025-12-31'
+);
+```
+
+##
+
+#### 8.4.3. Verification Queries
+
+```sql
+-- Total orders
+SELECT COUNT(*) AS total_orders FROM orders;
+
+-- Total order lines
+SELECT COUNT(*) AS total_order_details FROM order_details;
+
+-- Date distribution
+SELECT
+    MIN(order_date) AS min_order_date,
+    MAX(order_date) AS max_order_date
+FROM orders;
+```
+
+---
+
+## 9. Products Count per Category – Performance Analysis (Task 5)
+
+This section analyzes a query that retrieves the total number of products
+assigned to each category, including categories that do not contain any products.
+The focus is on understanding the execution plan and validating index usage
+rather than rewriting the query unnecessarily.
+
+---
+
+### Query
+
+```sql
+SELECT
+  c.category_id,
+  c.category_name,
+  COUNT(p.product_id) AS total_products
+FROM category c
+LEFT JOIN product p
+  ON p.category_id = c.category_id
+GROUP BY
+  c.category_id,
+  c.category_name
+ORDER BY total_products DESC;
+```
+
+##
+
+### Why LEFT JOIN?
+
+- Ensures that categories with zero products are still returned.
+- Preserves complete category visibility.
+
+##
+
+### 🔍 Execution Plan Analysis (EXPLAIN ANALYZE)
+
+Key observations from `EXPLAIN ANALYZE`:
+
+- The `category` table is scanned once (only ~100 rows).
+- The `product` table is accessed using a **covering index** on `category_id`.
+- No full table scan is performed on the `product` table.
+- Aggregation is performed using a temporary table (expected for `GROUP BY`).
+- Sorting is applied on the aggregated result set (100 rows only).
+
+This confirms an efficient execution plan with optimal index usage.
+
+##
+
+### ⚙️ Optimization Technique Applied
+
+- Verified that `product(category_id)` is indexed and used as a **covering index**.
+- Ensured accurate optimizer statistics using `ANALYZE TABLE`.
+- No query rewrite was required since the execution plan was already optimal.
+
+```sql
+ANALYZE TABLE category, product;
+```
+
+>**Optional optimizations (not applied):**
+>
+>- Removing `ORDER BY` if ordering is not required.
+>- Replacing `LEFT JOIN` with `INNER JOIN` if empty categories are not needed.
+
+##
+
+### 📊 Optimization Log Entry
+
+| Task | Simple Query | Execution Time Before | Optimization Technique | Rewrite Query | Execution Time After |
+|------|-------------|------------------------|------------------------|--------------|----------------------|
+| 5 | Count products per category | ~73.7 ms | FK index on product(category_id) used as a covering index + updated statistics | Same query | ~73–85 ms |
+
+
+---
+
+## 10. Customer Total Spending – Performance Analysis (Task 6)
+
+This section analyzes a query that calculates the **total spending per customer**
+by aggregating order amounts.  
+The focus is on understanding performance bottlenecks, improving execution strategy,
+and measuring the impact of each optimization step.
+
+##
+
+### Phase 1: Baseline Query (JOIN then GROUP BY)
+
+The initial approach joins the `customer` and `orders` tables first, then aggregates
+the results.
+
+```sql
+SELECT
+  c.customer_id,
+  CONCAT(c.first_name, ' ', c.last_name) AS customer_name,
+  SUM(o.total_amount) AS total_spending
+FROM customer c
+JOIN orders o
+  ON c.customer_id = o.customer_id
+GROUP BY c.customer_id, c.first_name, c.last_name;
+```
+
+##
+
+### 🔍 EXPLAIN ANALYZE – Key Observations
+
+Based on the execution plan analysis, the following behavior was observed:
+
+* The `orders` table is fully scanned (~800,000 rows).
+* For **each order row**, MySQL performs a single-row lookup on the `customer` table
+  using the **PRIMARY KEY** (nested-loop join).
+* Aggregation is executed using a **temporary table**.
+* Approximately **541,875 customer groups** are produced after aggregation.
+
+**Measured execution time:** ~4.6–4.7 seconds
+
+This approach is **logically correct**, but **inefficient** from a performance perspective
+because the `JOIN` is executed **before aggregation**, resulting in:
+
+* Repeated lookups on the `customer` table
+* Increased CPU and I/O cost
+* Poor scalability as data volume grows
+
+##
+
+### Phase 2: Rewrite – Aggregate First, Then JOIN
+
+To reduce the overall join cost, the aggregation step is moved **earlier** in the query
+execution flow.
+
+Instead of joining `customer` and `orders` first, the query:
+
+1. Aggregates the `orders` table **by `customer_id`**
+2. Produces a smaller intermediate result set
+3. Joins the aggregated result with the `customer` table **only once per customer**
+
+This strategy significantly reduces:
+
+* The number of JOIN operations
+* The size of intermediate datasets
+* Overall execution time
+
+The rewritten approach aligns better with how relational optimizers handle
+large-scale analytical queries.
+
+```sql
+WITH customer_spending AS (
+  SELECT
+    customer_id,
+    SUM(total_amount) AS total_spending
+  FROM orders
+  GROUP BY customer_id
+)
+SELECT
+  c.customer_id,
+  CONCAT(c.first_name, ' ', c.last_name) AS customer_name,
+  cs.total_spending
+FROM customer_spending cs
+JOIN customer c
+  ON c.customer_id = cs.customer_id;
+```
+
+### 🔍 EXPLAIN ANALYZE – Key Observations (After Rewrite)
+
+The execution plan after rewriting the query shows a clear improvement:
+
+* MySQL performs a **grouped aggregation on the `orders` table first**.
+* An **index scan** is used on `orders(customer_id)` (foreign key index).
+* The `JOIN` with `customer` now occurs **once per aggregated customer**
+  (~541,876 rows) instead of once per order row.
+* Temporary table usage remains **expected and acceptable** for aggregation.
+
+**Measured execution time:** ~2.6 seconds
+
+✅ This rewrite **significantly reduces join overhead**, cutting execution time
+from approximately **~4.7 seconds to ~2.6 seconds**.
+
+##
+
+### Phase 3: Top-N Optimization (ORDER BY + LIMIT)
+
+If the business requirement is to retrieve **only the top spending customers**,
+the result set can be reduced even further.
+
+By applying `ORDER BY` combined with `LIMIT`, MySQL needs to:
+
+* Sort a **much smaller result set**
+* Return only the most relevant customers
+* Reduce memory usage and execution time
+
+This optimization is especially effective for dashboards,
+leaderboards, and reporting screens where only the **top N results**
+are required.
+
+```sql
+WITH customer_spending AS (
+  SELECT
+    customer_id,
+    SUM(total_amount) AS total_spending
+  FROM orders
+  GROUP BY customer_id
+)
+SELECT
+  c.customer_id,
+  CONCAT(c.first_name, ' ', c.last_name) AS customer_name,
+  cs.total_spending
+FROM customer_spending cs
+JOIN customer c
+  ON c.customer_id = cs.customer_id
+ORDER BY cs.total_spending DESC
+LIMIT 100;
+```
+
+### 🔍 EXPLAIN ANALYZE – Key Observations (Top-N Optimization)
+
+After applying `ORDER BY` with `LIMIT`, the execution plan shows further improvements:
+
+* Aggregation is still performed on **all customers** (~541,000 rows).
+* A **sort operation** is applied on the aggregated result set.
+* The `JOIN` with the `customer` table is executed **only for the top 100 rows**
+  due to the `LIMIT` clause.
+* This drastically reduces both **join cost** and **result-processing overhead**.
+
+**Measured execution time:** ~1.7–1.8 seconds
+
+✅ This is the **best-performing option** when only the **top spending customers**
+are required.
+
+---
+
+## Optimization Summary
+
+Key performance insights from this task:
+
+* Aggregating data **as early as possible** significantly reduces expensive JOIN operations.
+* Limiting the result set using `LIMIT` minimizes unnecessary data processing and sorting.
+* Proper index usage on `orders(customer_id)` is **critical** for efficient grouping and aggregation.
+* Each optimization step was applied **independently** to clearly measure and understand its impact.
+
+This step-by-step optimization approach mirrors real-world performance tuning workflows
+used in analytical and reporting-heavy systems.
+
+##
+
+### 📊 Optimization Log Entry
+
+| Task | Simple Query | Execution Time Before | Optimization Technique | Rewrite Query | Execution Time After |
+|------|-------------|------------------------|------------------------|--------------|----------------------|
+| 6 | Total spending per customer | ~4.7s | Aggregate first (GROUP BY in orders), use FK index | CTE aggregate then JOIN | ~2.6s |
+| 6 | Top 100 spending customers | ~2.6s | Add `ORDER BY total_spending DESC LIMIT 100` | CTE + Top-N query | ~1.7–1.8s |
+
+
+---
+
