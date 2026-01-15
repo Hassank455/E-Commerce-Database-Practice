@@ -1192,3 +1192,191 @@ used in analytical and reporting-heavy systems.
 
 ---
 
+## 11. Most Recent Orders (1000) with Customer Info – Performance Analysis (Task 7)
+
+This section retrieves the **most recent 1000 orders** along with customer details.
+The main performance challenge is the `ORDER BY + LIMIT` on a large `orders` table.
+Without a supporting index, MySQL must scan and sort a large portion of the table.
+
+##
+
+### Simple Query (Before Optimization)
+
+```sql
+SELECT
+  o.order_id,
+  o.order_date,
+  o.total_amount,
+  c.customer_id,
+  CONCAT(c.first_name, ' ', c.last_name) AS customer_name,
+  c.email
+FROM orders o
+JOIN customer c
+  ON c.customer_id = o.customer_id
+ORDER BY o.order_date DESC, o.order_id DESC
+LIMIT 1000;
+```
+
+##
+
+### 🔍 Execution Plan Analysis (Before)
+
+Key observations from EXPLAIN ANALYZE:
+
+* orders was read using a **full table scan** (~800K rows).
+* MySQL performed a **large sort** on (order_date, order_id) to find the latest 1000 rows.
+* The join to customer was efficient (PK lookup) but it happened after the expensive sort.
+
+This explains the slower runtime (~341 ms).
+
+##
+
+### ⚙️ Optimization Technique Applied
+
+To avoid sorting a large dataset, a composite index was created to match the ordering:
+
+```sql
+CREATE INDEX idx_orders_recent
+ON orders (order_date, order_id, customer_id);
+
+ANALYZE TABLE orders, customer;
+```
+
+Why this helps:
+
+* The index is ordered by (order_date, order_id), so MySQL can scan it in reverse order
+to fetch the latest rows directly.
+* customer_id is included to support reading join keys directly from the index.
+
+##
+
+### Rewrite Query (After Optimization)
+
+Instead of sorting the entire orders table, we first select only the latest 1000 orders
+(using the index), then join the reduced set to customer.
+
+```sql
+WITH recent_orders AS (
+  SELECT
+    order_id,
+    customer_id,
+    order_date,
+    total_amount
+  FROM orders
+  ORDER BY order_date DESC, order_id DESC
+  LIMIT 1000
+)
+SELECT
+  ro.order_id,
+  ro.order_date,
+  ro.total_amount,
+  c.customer_id,
+  CONCAT(c.first_name, ' ', c.last_name) AS customer_name,
+  c.email
+FROM recent_orders ro
+JOIN customer c
+  ON c.customer_id = ro.customer_id
+ORDER BY ro.order_date DESC, ro.order_id DESC;
+```
+
+##
+
+### ✅ Execution Plan Improvement (After)
+
+* MySQL used **Index scan on orders using idx_orders_recent (reverse)** to fetch only 1000 rows.
+* No large sort was required (only sorting 1000 rows, which is cheap).
+* Join to customer remained efficient (PK lookup).
+
+Runtime improved significantly:
+
+* Before: ~341 ms
+* After: ~6–12 ms
+
+##
+
+### 📊 Optimization Log Entry
+
+| Task | Simple Query | Execution Time Before | Optimization Technique | Rewrite Query | Execution Time After |
+|------|-------------|------------------------|------------------------|--------------|----------------------|
+| 7 | Most recent 1000 orders + customer info | ~341 ms | Composite index for ORDER BY + LIMIT, updated statistics, CTE to limit before JOIN | CTE recent_orders + JOIN customer | ~6–12 ms |
+
+
+---
+
+### 12. Low Stock Products (< 10) – Performance Analysis (Task 8)
+
+This section lists products that have low stock quantities (less than 10),
+which is a common operational query for inventory monitoring and restocking.
+
+---
+
+### Query (Simple)
+
+```sql
+SELECT
+  product_id,
+  name,
+  stock_quantity
+FROM product
+WHERE stock_quantity < 10
+ORDER BY stock_quantity ASC;
+```
+
+##
+
+### 🔍 Execution Plan (Before Optimization)
+
+Key observations from EXPLAIN ANALYZE:
+
+* MySQL performed a **full table scan** on product (100,000 rows).
+* A filter was applied to keep only rows where stock_quantity < 10 (1,946 rows).
+* A **sort step** was required to order the filtered result set.
+
+This was expected, but not optimal for large datasets.
+
+##
+
+### ⚙️ Optimization Techniques Tested
+
+1) Normal Index on stock_quantity
+
+```sql
+CREATE INDEX idx_stock_quantity ON product (stock_quantity);
+ANALYZE TABLE product;
+```
+
+Result:
+
+* MySQL used an **index range scan** to fetch only rows where stock_quantity < 10.
+* However, the query still needed to fetch product_id and name from the table (not covered by the index).
+
+2) Covering Index (Adopted – Best Result)
+
+A covering index ensures that all selected columns are available from the index itself,
+so MySQL does not need extra lookups into the table.
+
+```sql
+CREATE INDEX idx_stock_quantity_covering
+ON product (stock_quantity, product_id, name);
+
+ANALYZE TABLE product;
+```
+
+Result:
+
+* MySQL used a **covering index range scan.**
+* No full table scan.
+* No additional table lookups were needed.
+* This produced the best runtime improvement.
+
+> **Note:**<br>
+> MySQL does not support partial/conditional indexes like:
+> CREATE INDEX ... WHERE stock_quantity < 10 (supported in PostgreSQL, not MySQL).
+
+##
+
+### 📊 Optimization Log Entry
+
+| Task | Simple Query | Execution Time Before | Optimization Technique | Rewrite Query | Execution Time After |
+|------|-------------|------------------------|------------------------|--------------|----------------------|
+| 8 | Low stock products (< 10) | ~123 ms | Covering index on (stock_quantity, product_id, name) + ANALYZE TABLE | Same query | ~2.3 ms |
